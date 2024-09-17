@@ -1,75 +1,114 @@
 #!/bin/bash
 
-# Đường dẫn tới thư mục lưu trữ bản sao lưu
-BACKUP_DIR="/path/to/backup"
-DATE=$(date +"%Y%m%d")  # Định dạng ngày yêu cầu
-TIME=$(date +"%H%M%S")
-SITENAME="your-sitename"  # Đặt tên cho site
-META_BACKUP_DIR="$BACKUP_DIR/meta_$DATE_$TIME"
-DATA_BACKUP_DIR="$BACKUP_DIR/data_$DATE_$TIME"
-META_ARCHIVE_NAME="meta-${SITENAME}-${DATE}.tar.gz"  # Tên file nén meta
-DATA_ARCHIVE_NAME="data-${SITENAME}-${DATE}.tar.gz"  # Tên file nén data
+# === Configurations ===
 
-# Danh sách địa chỉ TCP của các data node (chỉnh sửa cho phù hợp)
+# Path to the directory where backups will be stored
+BACKUP_DIR="/path/to/backup"
+LOG_FILE="/path/to/backup/backup.log"  # Path to the log file
+RETENTION_DAYS=7  # Backups older than this will be deleted
+
+DATE=$(date +"%Y%m%d")  # Date format
+TIME=$(date +"%H%M%S")
+SITENAME="your-sitename"  # Set the site name
+META_BACKUP_DIR=$(mktemp -d "$BACKUP_DIR/meta_${DATE}_${TIME}_XXXXXX")  # Temp dir for meta backup
+DATA_BACKUP_DIR=$(mktemp -d "$BACKUP_DIR/data_${DATE}_${TIME}_XXXXXX")  # Temp dir for data backup
+META_ARCHIVE_NAME="meta-${SITENAME}-${DATE}.tar.gz"  # Name for the meta archive
+DATA_ARCHIVE_NAME="data-${SITENAME}-${DATE}.tar.gz"  # Name for the data archive
+
+# List of TCP addresses of data nodes (modify as needed)
 DATA_NODES=("tcp://data-node1:8088" "tcp://data-node2:8088")
 
-# Thông tin Telegram API
-BOT_TOKEN="your-bot-token"  # Thay bằng bot token của bạn
-CHAT_ID="your-chat-id"      # Thay bằng chat ID của bạn
+# Telegram API information (recommended to set these as environment variables for security)
+BOT_TOKEN="${BOT_TOKEN:-your-bot-token}"  # Replace with your bot token
+CHAT_ID="${CHAT_ID:-your-chat-id}"      # Replace with your chat ID
 
-# Biến lưu trữ thông báo
-TELEGRAM_MESSAGE="Sao lưu cho site *${SITENAME}* vào ngày $DATE $TIME:\n"
+# === Functions ===
 
-# Hàm gửi thông báo tới Telegram
+# Logging function to write both to the console and a log file
+log_message() {
+    local message=$1
+    echo "$(date +"%Y-%m-%d %H:%M:%S") - $message" | tee -a "$LOG_FILE"
+}
+
+# Function to send a message to Telegram
 send_telegram_message() {
     local message=$1
     curl -s -X POST "https://api.telegram.org/bot$BOT_TOKEN/sendMessage" \
         -d chat_id="$CHAT_ID" \
-        -d text="$message" \
-        -d parse_mode="Markdown" > /dev/null
+        -d text="$message" > /dev/null
+    
+    if [ $? -ne 0 ]; then
+        log_message "Warning: Failed to send Telegram message."
+    fi
 }
 
-# Tạo thư mục backup nếu chưa tồn tại
-mkdir -p "$META_BACKUP_DIR" "$DATA_BACKUP_DIR"
-
-# Hàm để kiểm tra kết quả thực thi và dừng script nếu có lỗi
+# Function to check the execution status and stop the script if there's an error
 check_command_status() {
     if [ $? -ne 0 ]; then
-        TELEGRAM_MESSAGE+="Lỗi: $1 thất bại!\n"
-        send_telegram_message "$TELEGRAM_MESSAGE"
-        echo "Lỗi: $1 thất bại!" >&2
+        send_telegram_message "Error: $1 failed!"
+        log_message "Error: $1 failed!"
+        cleanup
         exit 1
     fi
 }
 
-# 1. Sao lưu Meta Nodes
-echo "Sao lưu Meta Nodes cho site $SITENAME..."
-influxd-ctl backup -strategy=only-meta "$META_BACKUP_DIR"
-check_command_status "Sao lưu Meta Nodes"
-TELEGRAM_MESSAGE+="Sao lưu Meta Nodes thành công!\n"
+# Function to calculate and log backup size
+calculate_backup_size() {
+    local archive=$1
+    local size=$(du -sh "$archive" | cut -f1)
+    log_message "Backup size of $archive: $size"
+    send_telegram_message "Backup size of $archive: $size"
+}
 
-# Nén meta backup với tên theo yêu cầu bằng tar
+# Function to clean up temporary directories
+cleanup() {
+    log_message "Cleaning up temporary directories..."
+    rm -rf "$META_BACKUP_DIR" "$DATA_BACKUP_DIR"
+}
+
+# Set a trap to clean up if the script is interrupted (SIGINT, SIGTERM)
+trap cleanup EXIT
+
+# Function to enforce backup retention policy
+enforce_retention_policy() {
+    log_message "Enforcing retention policy..."
+    find "$BACKUP_DIR" -type f -name "*.tar.gz" -mtime +$RETENTION_DAYS -exec rm -f {} \;
+    log_message "Removed backups older than $RETENTION_DAYS days."
+}
+
+# === Main Script ===
+
+log_message "Starting backup process for site $SITENAME..."
+
+# 1. Backup Meta Nodes
+log_message "Backing up Meta Nodes for site $SITENAME..."
+influxd-ctl backup -strategy=only-meta "$META_BACKUP_DIR"
+check_command_status "Meta Nodes Backup"
+
+# Compress the meta backup using tar with the specified name
 cd "$BACKUP_DIR"
 tar -czf "$META_ARCHIVE_NAME" -C "$META_BACKUP_DIR" .
-check_command_status "Nén Meta Backup"
-TELEGRAM_MESSAGE+="Đã nén Meta Backup thành công với tên file: $META_ARCHIVE_NAME\n"
+check_command_status "Compress Meta Backup"
+calculate_backup_size "$META_ARCHIVE_NAME"
 
-# 2. Sao lưu Data Nodes
+# 2. Backup Data Nodes
 for NODE in "${DATA_NODES[@]}"; do
-    echo "Sao lưu Data Node: $NODE cho site $SITENAME..."
+    log_message "Backing up Data Node: $NODE for site $SITENAME..."
     influxd-ctl backup -strategy=incremental -from "$NODE" "$DATA_BACKUP_DIR"
-    check_command_status "Sao lưu Data Node $NODE"
-    TELEGRAM_MESSAGE+="Sao lưu Data Node $NODE thành công!\n"
+    check_command_status "Data Node Backup $NODE"
 done
 
-# Nén data backup bằng tar
-cd "$BACKUP_DIR"
+# Compress the data backup using tar
 tar -czf "$DATA_ARCHIVE_NAME" -C "$DATA_BACKUP_DIR" .
-check_command_status "Nén Data Backup"
-TELEGRAM_MESSAGE+="Đã nén Data Backup thành công với tên file: $DATA_ARCHIVE_NAME\n"
+check_command_status "Compress Data Backup"
+calculate_backup_size "$DATA_ARCHIVE_NAME"
 
-# 3. Hoàn thành
-TELEGRAM_MESSAGE+="Quá trình sao lưu cho site *${SITENAME}* hoàn thành thành công!"
-send_telegram_message "$TELEGRAM_MESSAGE"
+# 3. Completion and Cleanup
+log_message "Backup successful for site $SITENAME. Files are stored in $BACKUP_DIR."
+send_telegram_message "Backup successful for site $SITENAME. Files are stored in $BACKUP_DIR."
 
-echo "Quá trình sao lưu cho site $SITENAME hoàn thành thành công!"
+# Enforce retention policy
+enforce_retention_policy
+
+# Clean up will happen via the trap
+log_message "Backup process for site $SITENAME completed successfully!"
